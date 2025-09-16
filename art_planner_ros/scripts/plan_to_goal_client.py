@@ -15,7 +15,7 @@ class PathToGoalClient:
         self.client.send_goal(goal)
 
     def __init__(self):
-        self.sub = rospy.Subscriber('/goal', PoseStamped, self.goalCallback)
+        self.sub = rospy.Subscriber('/move_base_simple/goal', PoseStamped, self.goalCallback)
 
         self.client = actionlib.SimpleActionClient('/art_planner/plan_to_goal', art_planner_msgs.msg.PlanToGoalAction)
 

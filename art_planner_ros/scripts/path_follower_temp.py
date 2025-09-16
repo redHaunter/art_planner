@@ -58,10 +58,6 @@ class PathFollower:
 
 
     def pathCallback(self, path_msg):
-        if self.path is not None and self.goal_pose is not None:
-            # Previous goal not reached, ignore this new path
-            rospy.loginfo("Ignoring new path, current goal not reached yet")
-            return
         self.fixed_frame = path_msg.header.frame_id
         self.path = []
         self.path_ros = path_msg
@@ -98,29 +94,17 @@ class PathFollower:
 
 
 
-    # def publishPath(self):
-    #     if self.fixed_frame is not None:
-    #         msg = Path()
-    #         msg.header.frame_id = self.fixed_frame
-    #         if self.path_ros is not None:
-    #             msg.poses = self.path_ros.poses
+    def publishPath(self):
+        if self.fixed_frame is not None:
+            msg = Path()
+            msg.header.frame_id = self.fixed_frame
+            if self.path_ros is not None:
+                msg.poses = self.path_ros.poses
 
-    #         self.pub_path.publish(msg)
+            self.pub_path.publish(msg)
 
 
-    def removePathNodesAlreadyReached(self):
-        if self.path is None or self.current_pose is None:
-            return
-        while len(self.path) > 0:
-            dx = self.path[0][0] - self.current_pose[0]
-            dy = self.path[0][1] - self.current_pose[1]
-            dist = (dx**2 + dy**2)**0.5
-            dyaw = getAngleError(self.path[0][2], self.current_pose[2])
-            if dist < GOAL_THRES_POS and abs(dyaw) < GOAL_THRES_ANG:
-                # Node already reached → remove it
-                self.removePathNodesBeforeIndex(1)
-            else:
-                break
+
 
     def removePathNodesBeforeIndex(self, index):
         self.path = self.path[index:]
@@ -140,10 +124,8 @@ class PathFollower:
                 else:
                     self.path = None
                     self.path_ros = None
-                    # self.publishPath()
+                    self.publishPath()
                 self.goal_pose = None
-                rospy.loginfo('Goal Reached!')
-
 
         # Only get new goal pose if we don't have one.
         if self.goal_pose is None:
@@ -166,7 +148,7 @@ class PathFollower:
 
                 self.removePathNodesBeforeIndex(largest_valid_index)
                 self.goal_pose = self.path[0]
-                # self.publishPath()
+                self.publishPath()
 
 
 
@@ -191,17 +173,9 @@ class PathFollower:
     def computeAndPublishTwist(self):
         self.updateCurrentPose()
         if self.path is not None and self.current_pose is not None:
-            self.removePathNodesAlreadyReached()
             self.updateCurrentGoalPose()
 
             if self.goal_pose is None:
-                msg = Twist()
-
-                msg.linear.x = 0.0
-                msg.linear.y = 0.0
-                msg.angular.z = 0.0
-                self.pub_cmd_vel.publish(msg)
-
                 return
 
             msg = TwistStamped()
@@ -233,16 +207,12 @@ class PathFollower:
 
             self.pub_twist.publish(msg)
 
-            msg = Twist()
-
-            # longitudinal and angular control
-            msg.linear.x = max(min(lon_rate, 0.1), -0.1)   # forward/backward
-            msg.angular.z = max(min(yaw_rate, 0.3), -0.3)  # turning
-
-            # disable lateral for diff drive
-            msg.linear.y = 0.0
-
-            self.pub_cmd_vel.publish(msg)
+            # Also publish plain Twist for /cmd_vel
+            cmd_vel_msg = Twist()
+            cmd_vel_msg.linear.x = msg.twist.linear.x
+            cmd_vel_msg.linear.y = msg.twist.linear.y
+            cmd_vel_msg.angular.z = msg.twist.angular.z
+            self.pub_cmd_vel.publish(cmd_vel_msg)
 
 
 

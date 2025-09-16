@@ -51,23 +51,44 @@ sampler:
     max_prob_unknown_samples: 0.1                   # The maximum probability of drawing samples from the unknown region.
 
 robot:      
-    base_frame: "base"                              # Frame ID which is used to get robot pose.
-    torso:
-        length: 1.31                                # [m] Length.
-        width: 0.65                                 # [m] Width.
-        height: 0.3                                 # [m] Height.
-        offset:                                     # [m] Torso center offset relative to base_frame.
+    base_frame: "base_link"                         # Frame ID which is used to get robot pose.
+    torso:                                         # Using torso to represent main body
+        length: 0.354                              # [m] TurtleBot3 Waffle length
+        width: 0.354                               # [m] TurtleBot3 Waffle width
+        height: 0.035                              # [m] TurtleBot3 Waffle height
+        offset:                                    # [m] Body center offset relative to base_frame
             x: 0.0
             y: 0.0
             z: 0.04
-    feet:
-        offset:                                     # [m] Reachability box offset relative to base_frame.
-            x: 0.51                                # Sign of value does not matter.
-            y: 0.2                                # Sign of value does not matter.
-            z: -0.475
-        reach:                                      # [m] Reachability of foot box size.
-            x: 0.2
-            y: 0.2
-            z: 0.2
+    feet:                                          # Using feet to represent wheels
+        offset:                                    # [m] Wheel position relative to base_frame
+            x: 0.143                               # Half of wheelbase (~0.287 m total length)
+            y: 0.143                               # Half of track width (~0.287 m total width)
+            z: 0.0                               # Wheels below base_link
+        reach:                                     # [m] Wheel radius/size approximation
+            x: 0.033                               # Wheel radius (~0.066 m diameter)
+            y: 0.033
+            z: 0.033
+
+
+# robot:      
+#     base_frame: "base_link"                              # Frame ID which is used to get robot pose.
+#     torso:
+#         length: 1.31                                # [m] Length.
+#         width: 0.65                                 # [m] Width.
+#         height: 0.3                                 # [m] Height.
+#         offset:                                     # [m] Torso center offset relative to base_frame.
+#             x: 0.0
+#             y: 0.0
+#             z: 0.04
+#     feet:
+#         offset:                                     # [m] Reachability box offset relative to base_frame.
+#             x: 0.51                                # Sign of value does not matter.
+#             y: 0.2                                # Sign of value does not matter.
+#             z: -0.475
+#         reach:                                      # [m] Reachability of foot box size.
+#             x: 0.2
+#             y: 0.2
+#             z: 0.2
 
 verbose: true
