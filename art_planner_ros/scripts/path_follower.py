@@ -1,312 +1,254 @@
-#!/usr/bin/env python 
-import rospy
-from nav_msgs.msg import Path
-from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
-import roslib
+#!/usr/bin/env python3
+
 import rospy
 import math
-import tf
-import numpy as np
+from nav_msgs.msg import Path
+from geometry_msgs.msg import Twist, PoseStamped
+from tf.transformations import euler_from_quaternion
+from nav_msgs.msg import Odometry
 
-
-
-ROBOT_FRAME = 'base_link'
-GOAL_THRES_POS = 0.2
-GOAL_THRES_ANG = 0.2
-FACE_GOAL_DIST = 1.0
-
-
-
-def getYaw(quat):
-    _, _, yaw = tf.transformations.euler_from_quaternion(quat)
-    return yaw
-
-def getConstrainedYaw(yaw):
-    while yaw > math.pi:
-        yaw -= 2*math.pi
-    while yaw < -math.pi:
-        yaw += 2*math.pi
-    return yaw
-
-
-def getAngleError(target, current):
-    dyaw = target - current
-    dyaw = getConstrainedYaw(dyaw)
-    return dyaw
-
-def getQuatFromYaw(yaw):
-    return tf.transformations.quaternion_from_euler(0, 0, yaw)
-
+try:
+    from scipy.interpolate import splprep, splev
+    has_scipy = True
+except ImportError:
+    has_scipy = False
 
 
 class PathFollower:
     def __init__(self):
-        self.listener = tf.TransformListener()
-        self.pub_twist = rospy.Publisher('/path_planning_and_following/twist', TwistStamped, queue_size=1)
-        self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
-        self.pub_path = rospy.Publisher('/art_planner/followed_path', Path, queue_size=1, latch=True)
-        self.sub = rospy.Subscriber('/art_planner/path', Path, self.pathCallback)
-        self.current_pose = None
-        self.goal_pose = None
-        self.fixed_frame = None
-        self.path = None
-        self.path_ros = None
-        self.gain_pid_pos = [2, 0.0, 0.0]
-        self.gain_pid_ang = [5, 0.0, 0.0]
-        self.i = [0, 0, 0]
+        rospy.init_node('path_follower_node', anonymous=True)
 
+        # Publishers and Subscribers
+        self.path_sub = rospy.Subscriber("/art_planner/path", Path, self.path_callback)
+        self.odom_sub = rospy.Subscriber("/odom", Odometry, self.odom_callback)
+        self.cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+        self.smooth_path_pub = rospy.Publisher("/art_planner/smooth_path", Path, queue_size=1)
 
-
-    def pathCallback(self, path_msg):
-        if self.path is not None and self.goal_pose is not None:
-            # Previous goal not reached, ignore this new path
-            rospy.loginfo("Ignoring new path, current goal not reached yet")
-            return
-        self.fixed_frame = path_msg.header.frame_id
+        # Robot state
+        self.robot_position = None
+        self.robot_orientation = None
         self.path = []
-        self.path_ros = path_msg
-        self.goal_pose = None
+        self.is_following_path = False
+        self.aligning_to_goal_direction = False
 
-        if len(path_msg.poses) > 1:
+        # Control parameters
+        self.linear_velocity = 0.2
+        self.angular_velocity = 0.5
 
-            for ros_pose in path_msg.poses:
-                pos = ros_pose.pose.position
-                rot = ros_pose.pose.orientation
-                yaw = getYaw([rot.x, rot.y, rot.z, rot.w])
-                self.path.append([pos.x, pos.y, yaw])
+        self.rate = rospy.Rate(10)
 
-            self.removePathNodesBeforeIndex(1)
-            rospy.loginfo('Got path: ' + str(self.path))
-            self.i = [0, 0, 0]    # Reset integrators.
-
-        else:
-            rospy.logwarn('Path message is too short')
-
-
-
-    def updateCurrentPose(self):
-        if self.fixed_frame is not None:
-            try:
-                (trans,rot) = self.listener.lookupTransform(self.fixed_frame, ROBOT_FRAME, rospy.Time(0))
-            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
-                rospy.logwarn_throttle('TF lookup of pose failed')
-                return
-
-            self.current_pose = [trans[0], trans[1], getYaw(rot)]
-        else:
-            rospy.logwarn_throttle(1, 'Fixed frame not set.')
-
-
-
-    # def publishPath(self):
-    #     if self.fixed_frame is not None:
-    #         msg = Path()
-    #         msg.header.frame_id = self.fixed_frame
-    #         if self.path_ros is not None:
-    #             msg.poses = self.path_ros.poses
-
-    #         self.pub_path.publish(msg)
-
-
-    def removePathNodesAlreadyReached(self):
-        if self.path is None or self.current_pose is None:
+    def path_callback(self, msg):
+        if self.is_following_path:
+            rospy.loginfo("Currently following a path. Ignoring new one.")
             return
-        while len(self.path) > 0:
-            dx = self.path[0][0] - self.current_pose[0]
-            dy = self.path[0][1] - self.current_pose[1]
-            dist = (dx**2 + dy**2)**0.5
-            dyaw = getAngleError(self.path[0][2], self.current_pose[2])
-            if dist < GOAL_THRES_POS and abs(dyaw) < GOAL_THRES_ANG:
-                # Node already reached → remove it
-                self.removePathNodesBeforeIndex(1)
-            else:
-                break
 
-    def removePathNodesBeforeIndex(self, index):
-        self.path = self.path[index:]
-        self.path_ros.poses = self.path_ros.poses[index:]
+        if not self.robot_position:
+            rospy.loginfo("Robot position unknown. Ignoring path.")
+            return
 
+        # Convert to simple list of x, y
+        raw_points = [(pose.pose.position.x, pose.pose.position.y) for pose in msg.poses]
+        raw_points = self.skip_loops_in_path(raw_points)
 
+        if len(raw_points) < 2:
+            rospy.logwarn("Received path too short to smooth.")
+            return
 
-    def updateCurrentGoalPose(self):
-        if self.goal_pose is not None:
-            dx = self.goal_pose[0] - self.current_pose[0]
-            dy = self.goal_pose[1] - self.current_pose[1]
-            dist = (dx**2 + dy**2)**0.5
-            dyaw = getAngleError(self.goal_pose[2], self.current_pose[2])
-            if dist < GOAL_THRES_POS and abs(dyaw) < GOAL_THRES_ANG:
-                if len(self.path) > 1:
-                    self.removePathNodesBeforeIndex(1)
-                else:
-                    self.path = None
-                    self.path_ros = None
-                    # self.publishPath()
-                self.goal_pose = None
-                rospy.loginfo('Goal Reached!')
+        # Smooth the path
+        smooth_points = self.smooth_path(raw_points)
 
+        # Check if robot is already at the last goal
+        last_x, last_y = smooth_points[-1]
+        dist_to_goal = self.get_distance_xy(self.robot_position.x, self.robot_position.y, last_x, last_y)
+        if dist_to_goal < 0.2:
+            rospy.loginfo("Robot is already at the goal. Ignoring path.")
+            return
 
-        # Only get new goal pose if we don't have one.
-        if self.goal_pose is None:
-            if self.current_pose is not None and self.path is not None:
-                # Set goal to final path segment in case we have a weird path
-                # and all checks fail.
-                largest_valid_index = 0
-                for i in range(len(self.path)-1):
-                    path_segment = np.array([self.path[i+1][0] - self.path[i][0],
-                                             self.path[i+1][1] - self.path[i][1]])
-                    robot_from_node = np.array([self.current_pose[0] - self.path[i][0],
-                                                self.current_pose[1] - self.path[i][1]])
-                    dist_along_path = robot_from_node.dot(path_segment)
-                    if (dist_along_path > 0):
-                        # Robot is "in front of" the current node.
-                        if i+1 > largest_valid_index:
-                            largest_valid_index = i+1
-                    else:
-                        break
+        # Convert to Path message
+        smooth_path_msg = Path()
+        smooth_path_msg.header = msg.header
+        for x, y in smooth_points:
+            pose = PoseStamped()
+            pose.header = msg.header
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            pose.pose.position.z = 0
+            smooth_path_msg.poses.append(pose)
 
-                self.removePathNodesBeforeIndex(largest_valid_index)
-                self.goal_pose = self.path[0]
-                # self.publishPath()
+        self.smooth_path_pub.publish(smooth_path_msg)  # Publish for RViz
 
+        # Store path and start following
+        self.path = smooth_path_msg.poses
+        self.aligning_to_goal_direction = True
+        self.is_following_path = True
+        rospy.loginfo("Started following smoothed path with {} points.".format(len(self.path)))
 
+    # def smooth_path(self, points, angle_threshold_deg=20):
+    #     if len(points) < 3:
+    #         return points  # Not enough points to smooth
 
-    def getYawTarget(self):
-        dx = self.goal_pose[0] - self.current_pose[0]
-        dy = self.goal_pose[1] - self.current_pose[1]
-        dist = (dx**2 + dy**2)**0.5
+    #     def angle_between(p1, p2):
+    #         return math.atan2(p2[1] - p1[1], p2[0] - p1[0])
 
-        if dist < FACE_GOAL_DIST:
-            return self.goal_pose[2]
+    #     smoothed = [points[0]]
+    #     prev_angle = angle_between(points[0], points[1])
+
+    #     for i in range(1, len(points) - 1):
+    #         current_angle = angle_between(points[i], points[i + 1])
+    #         angle_diff = abs(current_angle - prev_angle)
+    #         angle_diff = (angle_diff + math.pi) % (2 * math.pi) - math.pi  # Normalize to [-pi, pi]
+
+    #         if abs(angle_diff) * 180 / math.pi > angle_threshold_deg:
+    #             smoothed.append(points[i])  # Keep point only if angle changes too much
+
+    #         prev_angle = current_angle
+
+    #     smoothed.append(points[-1])  # Always include last point
+    #     return smoothed
+
+    def smooth_path(self, points, smoothing=0.0, resolution=100):
+        if has_scipy and len(points) >= 3:
+            try:
+                x, y = zip(*points)
+                tck, _ = splprep([x, y], s=smoothing)
+                u_fine = [i * 1.0 / resolution for i in range(resolution + 1)]
+                x_fine, y_fine = splev(u_fine, tck)
+                return list(zip(x_fine, y_fine))
+            except Exception as e:
+                rospy.logwarn("Spline smoothing failed: {}. Falling back to raw path.".format(str(e)))
+                return points
         else:
-            # Face towards goal.
-            yaw_target = math.atan2(dy, dx)
-            error = getAngleError(yaw_target, self.current_pose[2])
-            if abs(error) > math.pi*0.5:
-                # Face dat booty towards the goal.
-                yaw_target = getConstrainedYaw(yaw_target + math.pi)
-            return yaw_target
+            rospy.loginfo("Scipy not available or path too short, using linear interpolation.")
+            return points
+
+    def skip_loops_in_path(self, points, distance_threshold=0.1, min_index_gap=3):
+        """
+        Detect loops and skip them: if point i is close to point j > i + gap,
+        skip the intermediate points and jump from i to j.
+        """
+        i = 0
+        n = len(points)
+        new_path = []
+
+        while i < n:
+            xi, yi = points[i]
+            new_path.append((xi, yi))
+
+            # Look ahead to find close future point
+            jumped = False
+            for j in range(i + min_index_gap, n):
+                xj, yj = points[j]
+                dist = math.hypot(xi - xj, yi - yj)
+                if dist < distance_threshold:
+                    rospy.logwarn(f"Loop detected from point {i} to {j}, skipping intermediate points.")
+                    i = j  # Jump to j
+                    jumped = True
+                    break
+
+            if not jumped:
+                i += 1  # Move forward normally
+
+        return new_path
 
 
+    def align_with_goal_direction(self, goal_pose):
+        """
+        Align robot to face the direction from current position to final goal point.
+        """
+        dx = goal_pose.position.x - self.robot_position.x
+        dy = goal_pose.position.y - self.robot_position.y
+        target_angle = math.atan2(dy, dx)
 
-    def computeAndPublishTwist(self):
-        self.updateCurrentPose()
-        if self.path is not None and self.current_pose is not None:
-            self.removePathNodesAlreadyReached()
-            self.updateCurrentGoalPose()
+        angle_diff = target_angle - self.robot_orientation
+        angle_diff = (angle_diff + math.pi) % (2 * math.pi) - math.pi  # Normalize to [-pi, pi]
 
-            if self.goal_pose is None:
-                msg = Twist()
+        if abs(angle_diff) < 0.05:  # Within ~3 degrees
+            return True
+        else:
+            cmd_vel = Twist()
+            cmd_vel.angular.z = self.angular_velocity * math.copysign(1, angle_diff)
+            self.cmd_vel_pub.publish(cmd_vel)
+            return False
+        
+    def odom_callback(self, msg):
+        self.robot_position = msg.pose.pose.position
+        orientation = msg.pose.pose.orientation
+        _, _, self.robot_orientation = euler_from_quaternion([
+            orientation.x, orientation.y, orientation.z, orientation.w
+        ])
 
-                msg.linear.x = 0.0
-                msg.linear.y = 0.0
-                msg.angular.z = 0.0
-                self.pub_cmd_vel.publish(msg)
+    def get_distance(self, pos1, pos2):
+        return self.get_distance_xy(pos1.x, pos1.y, pos2.x, pos2.y)
 
-                return
+    def get_distance_xy(self, x1, y1, x2, y2):
+        return math.hypot(x2 - x1, y2 - y1)
 
-            msg = TwistStamped()
-            msg.header.frame_id = ROBOT_FRAME
-            msg.header.stamp = rospy.Time.now()
+    def get_angle_to_goal(self, goal_pose):
+        dx = goal_pose.position.x - self.robot_position.x
+        dy = goal_pose.position.y - self.robot_position.y
+        return math.atan2(dy, dx)
 
-            yaw = self.current_pose[2]
-            yaw_target = self.getYawTarget()
+    def follow_path(self):
+        if not self.path:
+            # Final orientation alignment skipped here (since we're rolling back)
+            self.cmd_vel_pub.publish(Twist())
+            self.is_following_path = False
+            return
+        
+        # Align before starting
+        if self.aligning_to_goal_direction:
+            aligned = self.align_with_goal_direction(self.path[-1].pose)
+            if aligned:
+                self.aligning_to_goal_direction = False
+                rospy.loginfo("Aligned with goal direction. Beginning movement.")
+            else:
+                return  # Keep rotating before moving
+            
+        goal_pose = self.path[0].pose
+        distance = self.get_distance(self.robot_position, goal_pose.position)
+        angle_to_goal = self.get_angle_to_goal(goal_pose)
+        angle_diff = angle_to_goal - self.robot_orientation
+        angle_diff = (angle_diff + math.pi) % (2 * math.pi) - math.pi
 
-            dx = self.goal_pose[0] - self.current_pose[0]
-            dy = self.goal_pose[1] - self.current_pose[1]
-            dyaw = getAngleError(yaw_target, self.current_pose[2])
+        cmd_vel = Twist()
 
-            dlon = math.cos(yaw)*dx + math.sin(yaw)*dy
-            dlat = -math.sin(yaw)*dx + math.cos(yaw)*dy
+        # === Proportional control gains ===
+        k_linear = 0.5
+        k_angular = 1.0
+        max_linear = 0.3
+        max_angular = 1.0
+        min_linear = 0.1
 
-            # Update integrator.
-            self.i[0] += dlon
-            self.i[1] += dlat
-            self.i[2] += dyaw
+        if distance > 0.1:
+            # Compute linear and angular speeds
+            linear = k_linear * distance
+            linear = max(min(linear, max_linear), min_linear)
 
-            lon_rate = dlon * self.gain_pid_pos[0] + self.i[0] * self.gain_pid_pos[1]
-            lat_rate = dlat * self.gain_pid_pos[0] + self.i[1] * self.gain_pid_pos[1]
-            yaw_rate = dyaw * self.gain_pid_ang[0] + self.i[2] * self.gain_pid_ang[1]
+            angular = k_angular * angle_diff
+            angular = max(min(angular, max_angular), -max_angular)
 
-            msg.twist.linear.x = lon_rate
-            msg.twist.linear.y = lat_rate
-            msg.twist.angular.z = yaw_rate
+            # Reverse logic if goal is behind
+            if abs(angle_diff) > 2 * math.pi / 3:
+                linear *= -1
+                angular *= -1
 
-            self.pub_twist.publish(msg)
+            cmd_vel.linear.x = linear
+            cmd_vel.angular.z = angular
+        else:
+            rospy.loginfo("Reached waypoint.")
+            self.path.pop(0)
 
-            msg = Twist()
+        self.cmd_vel_pub.publish(cmd_vel)
 
-            # longitudinal and angular control
-            msg.linear.x = max(min(lon_rate, 0.1), -0.1)   # forward/backward
-            msg.angular.z = max(min(yaw_rate, 0.3), -0.3)  # turning
-
-            # disable lateral for diff drive
-            msg.linear.y = 0.0
-
-            self.pub_cmd_vel.publish(msg)
-
-
-
-
+    def run(self):
+        while not rospy.is_shutdown():
+            if self.is_following_path:
+                self.follow_path()
+            self.rate.sleep()
 
 
 if __name__ == '__main__':
-    rospy.init_node('path_follower_pid')
-
-    follower = PathFollower()
-
-    rate = rospy.Rate(10) # 10hz
-    while not rospy.is_shutdown():
-        follower.computeAndPublishTwist()
-        rate.sleep()
-        
-
-
-
-
-#!/usr/bin/env python
-# license removed for brevity
-# import rospy
-# from std_msgs.msg import String
-
-# def talker():
-#     pub = rospy.Publisher('chatter', String, queue_size=10)
-#     rospy.init_node('talker', anonymous=True)
-#     rate = rospy.Rate(10) # 10hz
-#     while not rospy.is_shutdown():
-#         hello_str = "hello world %s" % rospy.get_time()
-#         rospy.loginfo(hello_str)
-#         pub.publish(hello_str)
-#         rate.sleep()
-
-# if __name__ == '__main__':
-#     try:
-#         talker()
-#     except rospy.ROSInterruptException:
-#         pass
-
-
-
-
-#!/usr/bin/env python
-# import rospy
-# from std_msgs.msg import String
-
-# def callback(data):
-#     rospy.loginfo(rospy.get_caller_id() + "I heard %s", data.data)
-    
-# def listener():
-
-#     # In ROS, nodes are uniquely named. If two nodes with the same
-#     # name are launched, the previous one is kicked off. The
-#     # anonymous=True flag means that rospy will choose a unique
-#     # name for our 'listener' node so that multiple listeners can
-#     # run simultaneously.
-#     rospy.init_node('listener', anonymous=True)
-
-#     rospy.Subscriber("chatter", String, callback)
-
-#     # spin() simply keeps python from exiting until this node is stopped
-#     rospy.spin()
-
-# if __name__ == '__main__':
-#     listener()
+    try:
+        PathFollower().run()
+    except rospy.ROSInterruptException:
+        pass

@@ -8,7 +8,7 @@ planner:
     traversability_thres: 0.15                      # Traversability smaller than this is considered untraversable.
     simplify_solution: true                         # Simplify the solution path before publishing.
     snap_goal_to_map: true                          # Get z, roll, pitch from elevation map.
-    unknown_space_untraversable: true               # If set true, unknown space is assumed to be untraversable.
+    unknown_space_untraversable: false               # If set true, unknown space is assumed to be untraversable.
     safety:
         foothold_margin: 0.3                        # [m] Edges are eroded this much to avoid stepping close to edges.
         foothold_margin_max_hole_size: 0.3          # [m] Maximum hole size to ignore during erosion.
@@ -17,8 +17,8 @@ planner:
         foothold_margin_min_step: 0.3               # [m] Minimum step up to ignore during erosion.
         foothold_size: 0.1                          # [m] Circular diameter which is considered minimal for a foothold.
     start_goal_search:
-        start_radius: 0.2                           # [m] Try to find a valid start pose in this radius if selected start is invalid.
-        goal_radius: 0.5                            # [m] Try to find a valid goal pose in this radius if selected pose is invalid.
+        start_radius: 0.1                           # [m] Try to find a valid start pose in this radius if selected start is invalid.
+        goal_radius: 0.1                            # [m] Try to find a valid goal pose in this radius if selected pose is invalid.
         n_iter: 1000                                # Sample n times to find a valid pose.
     lazy_prm_star_min_update:
         invalidate_updated_graph_components: true   # Invalidate planner graph vertices and edges which were recently observed (and therefore might have changed).
